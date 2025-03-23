@@ -63,8 +63,9 @@ class ReportView(APIView):
         except ValueError:
             return JsonResponse({"error": "Invalid date format. Please use YYYY-MM-DD."}, status=400)
 
-        print(item_code)
         item = get_object_or_404(Items, code=item_code)
+
+        # Ambil PurchaseDetail
         purchase_details = PurchaseDetail.objects.filter(
             item_code=item, 
             is_deleted=False,
@@ -75,17 +76,49 @@ class ReportView(APIView):
             total_in_qty=Sum('quantity'),
             total_in_price=Sum(F('quantity') * F('unit_price'))
         )
-        
+
+        # Ambil SellDetail dan hitung harga berdasarkan PurchaseDetail
         sell_details = SellDetail.objects.filter(
             item_code=item,
             is_deleted=False,
             created_at__range=[start_date, end_date]
         ).order_by('created_at')
 
-        sell_summary = sell_details.aggregate(
-            total_out_qty=Sum('quantity'),
-            total_out_price=Sum(F('quantity') * F('unit_price'))
-        )
+        total_out_qty = 0
+        total_out_price = 0
+
+        # Hitung total out qty dan total out price berdasarkan PurchaseDetail
+        for sell in sell_details:
+            purchase_details_for_sell = PurchaseDetail.objects.filter(
+                item_code=sell.item_code,
+                is_deleted=False
+            ).order_by('created_at')
+
+            remaining_quantity = sell.quantity
+            for purchase in purchase_details_for_sell:
+                available_stock = purchase.quantity
+                unit_price = purchase.unit_price
+
+                if remaining_quantity <= 0:
+                    break
+
+                if available_stock >= remaining_quantity:
+                    total_out_price += remaining_quantity * unit_price
+                    total_out_qty += remaining_quantity
+                    purchase.quantity -= remaining_quantity
+                    remaining_quantity = 0
+                else:
+                    total_out_price += available_stock * unit_price
+                    total_out_qty += available_stock
+                    remaining_quantity -= available_stock
+                    purchase.quantity = 0
+
+                purchase.save()
+
+        sell_summary = {
+            "total_out_qty": total_out_qty,
+            "total_out_price": total_out_price
+        }
 
         report = {
             "result": {
@@ -102,10 +135,11 @@ class ReportView(APIView):
             }
         }
 
+        # Tambahkan PurchaseDetail ke laporan
         for purchase in purchase_details:
             report['result']['items'].append({
                 "date": purchase.created_at.strftime('%d-%m-%Y'),
-                "description": purchase.description,
+                "description": purchase.header_code.description,
                 "code": f"P-{purchase.id:03d}",
                 "in_qty": purchase.quantity,
                 "in_price": purchase.unit_price,
@@ -120,22 +154,51 @@ class ReportView(APIView):
                 "balance": (purchase.quantity * purchase.unit_price),
             })
         
+        # Tambahkan SellDetail ke laporan
         for sell in sell_details:
+            # Calculate unit_price dynamically
+            purchase_details_for_sell = PurchaseDetail.objects.filter(
+                item_code=sell.item_code,
+                is_deleted=False
+            ).order_by('created_at')
+
+            remaining_quantity = sell.quantity
+            total_price = 0
+            unit_price = 0
+
+            for purchase in purchase_details_for_sell:
+                available_stock = purchase.quantity
+                if remaining_quantity <= 0:
+                    break
+
+                if available_stock >= remaining_quantity:
+                    unit_price = purchase.unit_price
+                    total_price += remaining_quantity * unit_price
+                    remaining_quantity = 0
+                else:
+                    unit_price = purchase.unit_price
+                    total_price += available_stock * unit_price
+                    remaining_quantity -= available_stock
+
             report['result']['items'].append({
                 "date": sell.created_at.strftime('%d-%m-%Y'),
-                "description": sell.description,
+                "description": sell.header_code.description,
                 "code": f"S-{sell.id:03d}",
                 "in_qty": 0,
                 "in_price": 0,
                 "in_total": 0,
                 "out_qty": sell.quantity,
-                "out_price": sell.unit_price,
-                "out_total": sell.quantity * sell.unit_price,
+                "out_price": unit_price,
+                "out_total": total_price,
                 "stock_qty": [0],
-                "stock_price": [sell.unit_price],
-                "stock_total": [sell.quantity * sell.unit_price],
+                "stock_price": [unit_price],
+                "stock_total": [total_price],
                 "balance_qty": (purchase_summary['total_in_qty'] or 0) - (sell_summary['total_out_qty'] or 0),
                 "balance": (purchase_summary['total_in_price'] or 0) - (sell_summary['total_out_price'] or 0),
             })
         
         return JsonResponse(report)
+
+
+
+
